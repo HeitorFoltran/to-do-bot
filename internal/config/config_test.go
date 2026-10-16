@@ -42,3 +42,28 @@ func TestLoadReminderOff(t *testing.T) {
 		t.Errorf("REMINDER_CRON=off: %+v", d)
 	}
 }
+
+func TestLoadBackup(t *testing.T) {
+	cfg, err := load(env(map[string]string{"DISCORD_TOKEN": "t"}))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.BackupDir != "" || cfg.BackupCron != DefaultBackupCron || cfg.BackupKeep != DefaultBackupKeep {
+		t.Errorf("padrões de backup: %+v", cfg)
+	}
+
+	cfg, err = load(env(map[string]string{"DISCORD_TOKEN": "t", "BACKUP_DIR": "/b", "BACKUP_KEEP": "7"}))
+	if err != nil || cfg.BackupDir != "/b" || cfg.BackupKeep != 7 {
+		t.Errorf("backup configurado: %+v, %v", cfg, err)
+	}
+
+	for _, c := range []map[string]string{
+		{"DISCORD_TOKEN": "t", "BACKUP_KEEP": "0"},
+		{"DISCORD_TOKEN": "t", "BACKUP_KEEP": "muitos"},
+		{"DISCORD_TOKEN": "t", "BACKUP_DIR": "/b", "BACKUP_CRON": "* * * * *"},
+	} {
+		if _, err := load(env(c)); err == nil {
+			t.Errorf("load(%v) deveria falhar", c)
+		}
+	}
+}

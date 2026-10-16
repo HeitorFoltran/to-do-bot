@@ -72,6 +72,13 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
+func (s *Store) Backup(ctx context.Context, path string) error {
+	if _, err := s.db.ExecContext(ctx, `VACUUM INTO ?`, path); err != nil {
+		return fmt.Errorf("gerando backup em %s: %w", path, err)
+	}
+	return nil
+}
+
 func (s *Store) Close() error {
 	return s.db.Close()
 }

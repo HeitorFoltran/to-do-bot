@@ -21,7 +21,10 @@ Copie `.env.example` para `.env` e preencha.
 | `DISCORD_TOKEN` | sim | | Token do bot |
 | `DB_PATH` | não | `./merges.db` | Arquivo SQLite (no Docker é sempre `/data/merges.db`) |
 | `REMINDER_CRON` | não | `0 9 * * 3` | Cron padrão do lembrete para servidores sem `/config`. `off` desliga por padrão. |
-| `TZ_NAME` | não | `America/Sao_Paulo` | Fuso padrão para servidores sem `/config` |
+| `TZ_NAME` | não | `America/Sao_Paulo` | Fuso padrão para servidores sem `/config` e fuso do backup |
+| `BACKUP_DIR` | não | | Pasta dos backups. Vazio desliga (no Docker é sempre `/backups`, ligada a `./backups`). |
+| `BACKUP_CRON` | não | `0 3 * * *` | Quando fazer o backup (padrão: todo dia às 03:00) |
+| `BACKUP_KEEP` | não | `14` | Quantos backups manter; os mais antigos são apagados |
 
 ## Comandos
 
@@ -46,14 +49,15 @@ go run ./cmd/bot
 go test ./...
 ```
 
-## Deploy (VPS com Docker)
+## Deploy (Ubuntu com Docker)
 
-Em uma VPS Linux com [Docker](https://docs.docker.com/engine/install/) instalado:
+Em um Ubuntu com [Docker](https://docs.docker.com/engine/install/ubuntu/) instalado:
 
 ```sh
 git clone git@github.com:HeitorFoltran/to-do-bot.git
 cd to-do-bot
 cp .env.example .env   # preencha DISCORD_TOKEN
+mkdir -p backups && sudo chown 65532:65532 backups
 docker compose up -d --build
 docker compose logs -f
 ```
@@ -69,19 +73,41 @@ docker compose up -d --build
 
 Alterar o `.env`: edite o arquivo e rode `docker compose up -d`.
 
-Backup do banco (o bot fica parado por alguns segundos, para o arquivo ficar consistente):
+## Backup
 
-```sh
-docker compose stop
-docker compose cp merge-bot:/data/merges.db ./backup-merges.db
-docker compose start
-```
+O bot faz um backup ao subir e depois no horário de `BACKUP_CRON`, sem parar, na pasta `backups/` do projeto (`merges-AAAA-MM-DD_HH-MM-SS.db`), mantendo os últimos `BACKUP_KEEP`. Copie essa pasta para fora do PC de vez em quando.
 
-Para levar um banco existente para o servidor:
+### Restaurar no mesmo PC
 
-```sh
-docker compose stop
-docker run --rm -v merge-bot-data:/data -v "$PWD":/src alpine \
-  sh -c 'cp /src/merges.db /data/merges.db && rm -f /data/merges.db-wal /data/merges.db-shm && chown 65532:65532 /data/merges.db'
-docker compose start
-```
+A restauração substitui o banco atual: tudo o que foi registrado depois do backup se perde.
+
+1. Escolha o backup:
+   ```sh
+   ls -l backups/
+   ```
+2. Pare o bot e guarde o banco atual por segurança:
+   ```sh
+   docker compose stop
+   docker compose cp merge-bot:/data/merges.db ./backups/antes-de-restaurar.db
+   ```
+3. Copie o backup para o volume, trocando `ARQUIVO.db` pelo nome escolhido:
+   ```sh
+   docker run --rm -v merge-bot-data:/data -v "$PWD/backups":/b alpine \
+     sh -c 'cp /b/ARQUIVO.db /data/merges.db && rm -f /data/merges.db-wal /data/merges.db-shm && chown 65532:65532 /data/merges.db'
+   ```
+4. Suba e confira:
+   ```sh
+   docker compose start
+   docker compose logs --tail 20
+   ```
+
+### Restaurar em outra máquina
+
+1. Faça os passos de [Deploy](#deploy-ubuntu-com-docker) até criar a pasta `backups/`, sem subir o bot.
+2. Copie o backup para `backups/`.
+3. Crie o volume e pare o bot:
+   ```sh
+   docker compose up -d --build
+   docker compose stop
+   ```
+4. Siga os passos 3 e 4 de "Restaurar no mesmo PC".

@@ -8,12 +8,15 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
+	"github.com/robfig/cron/v3"
 
 	_ "time/tzdata"
 
+	"merge-bot/internal/backup"
 	"merge-bot/internal/bot"
 	"merge-bot/internal/config"
 	"merge-bot/internal/reminder"
@@ -53,6 +56,12 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	stopBackups, err := startBackups(ctx, cfg, st)
+	if err != nil {
+		return err
+	}
+	defer stopBackups()
+
 	rem := reminder.New(session, st)
 	sched := reminder.NewScheduler(ctx, rem)
 	defer sched.Stop()
@@ -75,5 +84,40 @@ func run() error {
 	slog.Info("encerrando")
 
 	sched.Stop()
+	stopBackups()
 	return nil
+}
+
+func startBackups(ctx context.Context, cfg *config.Config, st *store.Store) (stop func(), err error) {
+	if cfg.BackupDir == "" {
+		slog.Info("backup desligado (BACKUP_DIR vazio)")
+		return func() {}, nil
+	}
+	loc, err := time.LoadLocation(cfg.Timezone)
+	if err != nil {
+		return nil, err
+	}
+	schedule, err := reminder.ParseSchedule(cfg.BackupCron, cfg.Timezone)
+	if err != nil {
+		return nil, err
+	}
+
+	b := backup.New(st, cfg.BackupDir, cfg.BackupKeep, loc)
+	run := func() {
+		runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		path, err := b.Run(runCtx)
+		if err != nil {
+			slog.Error("backup falhou", "err", err, "dir", cfg.BackupDir)
+			return
+		}
+		slog.Info("backup criado", "arquivo", path)
+	}
+
+	run()
+	c := cron.New()
+	c.Schedule(schedule, cron.FuncJob(run))
+	c.Start()
+	slog.Info("backup agendado", "cron", cfg.BackupCron, "tz", cfg.Timezone, "dir", cfg.BackupDir, "manter", cfg.BackupKeep)
+	return func() { <-c.Stop().Done() }, nil
 }
