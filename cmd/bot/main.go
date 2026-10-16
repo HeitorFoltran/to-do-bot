@@ -8,13 +8,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
-	"github.com/robfig/cron/v3"
 
-	// Embute a base de fusos: a imagem final não tem /usr/share/zoneinfo.
 	_ "time/tzdata"
 
 	"merge-bot/internal/bot"
@@ -53,10 +50,19 @@ func run() error {
 	}
 	session.Identify.Intents = discordgo.IntentsGuilds
 
-	handler := bot.NewHandler(st, cfg.Location)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	rem := reminder.New(session, st)
+	sched := reminder.NewScheduler(ctx, rem)
+	defer sched.Stop()
+
+	handler := bot.NewHandler(st, rem, sched, cfg.DefaultSettings())
 	session.AddHandler(handler.OnInteraction)
+	session.AddHandler(handler.OnGuildCreate)
+	session.AddHandler(handler.OnGuildDelete)
 	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
-		slog.Info("conectado ao Discord", "user", r.User.Username)
+		slog.Info("conectado ao Discord", "user", r.User.Username, "servidores", len(r.Guilds))
 	})
 
 	if err := session.Open(); err != nil {
@@ -64,53 +70,10 @@ func run() error {
 	}
 	defer session.Close()
 
-	appID, err := applicationID(session)
-	if err != nil {
-		return err
-	}
-	if err := bot.RegisterCommands(session, appID, cfg.GuildID); err != nil {
-		return err
-	}
-	slog.Info("comandos registrados", "guild_id", cfg.GuildID)
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	var scheduler *cron.Cron
-	if cfg.ReminderEnabled() {
-		rem := reminder.New(session, st, cfg.GuildID, cfg.ReminderChannelID)
-		scheduler = cron.New(cron.WithLocation(cfg.Location))
-		if _, err := scheduler.AddFunc(cfg.ReminderCron, func() {
-			runCtx, cancel := context.WithTimeout(ctx, time.Minute)
-			defer cancel()
-			rem.Run(runCtx)
-		}); err != nil {
-			return fmt.Errorf("agendando lembrete: %w", err)
-		}
-		scheduler.Start()
-		slog.Info("lembrete agendado", "cron", cfg.ReminderCron, "tz", cfg.Location.String(), "channel_id", cfg.ReminderChannelID)
-	} else {
-		slog.Info("lembrete desligado (REMINDER_CHANNEL_ID vazio)")
-	}
-
 	slog.Info("bot rodando; Ctrl+C para sair")
 	<-ctx.Done()
 	slog.Info("encerrando")
 
-	if scheduler != nil {
-		// Espera um lembrete em andamento terminar.
-		<-scheduler.Stop().Done()
-	}
+	sched.Stop()
 	return nil
-}
-
-func applicationID(s *discordgo.Session) (string, error) {
-	if s.State != nil && s.State.User != nil {
-		return s.State.User.ID, nil
-	}
-	u, err := s.User("@me")
-	if err != nil {
-		return "", fmt.Errorf("obtendo usuário do bot: %w", err)
-	}
-	return u.ID, nil
 }

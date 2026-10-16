@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 )
@@ -22,8 +23,8 @@ func sample(guild, reviewer string, createdAt time.Time) *Merge {
 		GuildID:    guild,
 		AuthorID:   "author",
 		ReviewerID: reviewer,
-		TaskURL:    "https://tasks.example.com/1",
-		MergeURL:   "https://git.example.com/mr/1",
+		TaskURLs:   []string{"https://tasks.example.com/1"},
+		MergeURLs:  []string{"https://git.example.com/mr/1", "https://git.example.com/mr/2"},
 		ChannelID:  "chan",
 		CreatedAt:  createdAt,
 	}
@@ -49,7 +50,7 @@ func TestCreateAndGet(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 	if got.GuildID != "g1" || got.ReviewerID != "r1" || got.AuthorID != "author" ||
-		got.TaskURL != in.TaskURL || got.MergeURL != in.MergeURL || got.Note != "urgente" ||
+		!slices.Equal(got.TaskURLs, in.TaskURLs) || !slices.Equal(got.MergeURLs, in.MergeURLs) || got.Note != "urgente" ||
 		got.ChannelID != "chan" || got.MessageID != "" {
 		t.Errorf("Get devolveu %+v", got)
 	}
@@ -88,32 +89,59 @@ func TestListPendingOrderAndFilter(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
 
-	// Inseridos fora de ordem cronológica.
-	mustCreate(t, st, sample("g1", "r1", base.Add(2*time.Hour))) // id 1
-	mustCreate(t, st, sample("g1", "r2", base))                  // id 2
-	mustCreate(t, st, sample("g1", "r1", base.Add(time.Hour)))   // id 3
-	mustCreate(t, st, sample("g2", "r1", base.Add(-time.Hour)))  // id 4, outro servidor
-	mustCreate(t, st, sample("g1", "r2", base.Add(2*time.Hour))) // id 5, empata com id 1
+	mustCreate(t, st, sample("g1", "r1", base.Add(2*time.Hour)))
+	mustCreate(t, st, sample("g1", "r2", base))
+	mustCreate(t, st, sample("g1", "r1", base.Add(time.Hour)))
+	mustCreate(t, st, sample("g2", "r1", base.Add(-time.Hour)))
+	mustCreate(t, st, sample("g1", "r2", base.Add(2*time.Hour)))
 
-	all, err := st.ListPending(ctx, "g1", "")
+	all, err := st.ListPending(ctx, "g1", Filter{})
 	if err != nil {
 		t.Fatalf("ListPending: %v", err)
 	}
 	assertIDs(t, all, 2, 3, 1, 5)
 
-	r1, err := st.ListPending(ctx, "g1", "r1")
+	r1, err := st.ListPending(ctx, "g1", Filter{ReviewerID: "r1"})
 	if err != nil {
 		t.Fatalf("ListPending r1: %v", err)
 	}
 	assertIDs(t, r1, 3, 1)
 
-	none, err := st.ListPending(ctx, "g1", "ninguem")
+	none, err := st.ListPending(ctx, "g1", Filter{ReviewerID: "ninguem"})
 	if err != nil {
 		t.Fatalf("ListPending vazio: %v", err)
 	}
 	if len(none) != 0 {
 		t.Errorf("esperava lista vazia, veio %d", len(none))
 	}
+}
+
+func TestListPendingFilterByAuthor(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+
+	withAuthor := func(author, reviewer string, at time.Time) *Merge {
+		m := sample("g1", reviewer, at)
+		m.AuthorID = author
+		return m
+	}
+	mustCreate(t, st, withAuthor("a1", "r1", base))
+	mustCreate(t, st, withAuthor("a2", "r1", base.Add(time.Hour)))
+	mustCreate(t, st, withAuthor("a1", "r2", base.Add(2*time.Hour)))
+	mustCreate(t, st, withAuthor("a1", "r1", base.Add(3*time.Hour)))
+
+	a1, err := st.ListPending(ctx, "g1", Filter{AuthorID: "a1"})
+	if err != nil {
+		t.Fatalf("ListPending a1: %v", err)
+	}
+	assertIDs(t, a1, 1, 3, 4)
+
+	both, err := st.ListPending(ctx, "g1", Filter{ReviewerID: "r1", AuthorID: "a1"})
+	if err != nil {
+		t.Fatalf("ListPending r1+a1: %v", err)
+	}
+	assertIDs(t, both, 1, 4)
 }
 
 func TestDelete(t *testing.T) {
@@ -189,5 +217,66 @@ func assertIDs(t *testing.T, got []Merge, want ...int64) {
 		if got[k].ID != want[k] {
 			t.Errorf("posição %d: id %d, quer %d", k, got[k].ID, want[k])
 		}
+	}
+}
+
+func TestSettings(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	if _, err := st.GetSettings(ctx, "g1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetSettings sem registro: err = %v", err)
+	}
+
+	in := &Settings{GuildID: "g1", ReminderCron: "0 9 * * 3", Timezone: "America/Sao_Paulo", ReminderEnabled: true}
+	if err := st.SaveSettings(ctx, in); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	in.ReminderCron, in.ReminderEnabled = "0 10 * * 1", false
+	if err := st.SaveSettings(ctx, in); err != nil {
+		t.Fatalf("SaveSettings (update): %v", err)
+	}
+	if err := st.SaveSettings(ctx, &Settings{GuildID: "g2", ReminderCron: "0 8 * * 5", Timezone: "UTC", ReminderEnabled: true}); err != nil {
+		t.Fatalf("SaveSettings g2: %v", err)
+	}
+
+	got, err := st.GetSettings(ctx, "g1")
+	if err != nil {
+		t.Fatalf("GetSettings: %v", err)
+	}
+	if *got != *in {
+		t.Errorf("GetSettings = %+v, quer %+v", got, in)
+	}
+	g2, err := st.GetSettings(ctx, "g2")
+	if err != nil || g2.Timezone != "UTC" {
+		t.Errorf("g2 = %+v, err = %v", g2, err)
+	}
+}
+
+func TestUpdate(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	m := sample("g1", "r1", time.Now())
+	m.Note = "antes"
+	id := mustCreate(t, st, m)
+
+	m.ReviewerID = "r2"
+	m.TaskURLs = []string{"https://t/novo"}
+	m.MergeURLs = []string{"https://m/1", "https://m/2"}
+	m.Note = ""
+	if err := st.Update(ctx, m); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	got, err := st.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.ReviewerID != "r2" || !slices.Equal(got.TaskURLs, m.TaskURLs) ||
+		!slices.Equal(got.MergeURLs, m.MergeURLs) || got.Note != "" || got.AuthorID != "author" {
+		t.Errorf("depois do Update: %+v", got)
+	}
+
+	if err := st.Update(ctx, &Merge{ID: 999}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Update inexistente: err = %v", err)
 	}
 }

@@ -1,65 +1,80 @@
-// Package reminder posta o lembrete semanal de merges pendentes.
 package reminder
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
-	"time"
 
 	"github.com/bwmarrin/discordgo"
 
-	"merge-bot/internal/bot"
 	"merge-bot/internal/store"
 )
 
-// maxMessageLen é o limite de caracteres de uma mensagem do Discord.
-const maxMessageLen = 2000
-
 type Reminder struct {
-	session   *discordgo.Session
-	store     *store.Store
-	guildID   string
-	channelID string
-	now       func() time.Time
+	session *discordgo.Session
+	store   *store.Store
 }
 
-func New(s *discordgo.Session, st *store.Store, guildID, channelID string) *Reminder {
-	return &Reminder{session: s, store: st, guildID: guildID, channelID: channelID, now: time.Now}
+func New(s *discordgo.Session, st *store.Store) *Reminder {
+	return &Reminder{session: s, store: st}
 }
 
-// Run busca os pendentes e posta o lembrete. Sem pendentes, não posta nada.
-func (r *Reminder) Run(ctx context.Context) {
-	merges, err := r.store.ListPending(ctx, r.guildID, "")
+type Options struct {
+	UserID  string
+	Message string
+}
+
+type Result struct {
+	Pending   int
+	Reviewers int
+	Failed    int
+}
+
+func (r *Reminder) Run(ctx context.Context, guildID string, opt Options) (Result, error) {
+	merges, err := r.store.ListPending(ctx, guildID, store.Filter{ReviewerID: opt.UserID})
 	if err != nil {
-		slog.Error("lembrete: listando pendentes", "err", err)
-		return
+		return Result{}, fmt.Errorf("listando pendentes: %w", err)
 	}
-	if len(merges) == 0 {
-		slog.Info("lembrete: nenhum pendente, nada a postar")
-		return
+	res := Result{Pending: len(merges)}
+
+	reviewers, byReviewer := groupByReviewer(merges)
+
+	if opt.UserID != "" && opt.Message != "" && len(reviewers) == 0 {
+		reviewers = []string{opt.UserID}
+	}
+	if len(reviewers) == 0 {
+		slog.Info("lembrete: nenhum pendente, nada a enviar", "guild_id", guildID, "usuario", opt.UserID)
+		return res, nil
 	}
 
-	messages, reviewers := BuildMessages(merges, r.now())
-	for _, content := range messages {
-		_, err := r.session.ChannelMessageSendComplex(r.channelID, &discordgo.MessageSend{
-			Content: content,
-			// Notifica só os responsáveis, não os autores.
-			AllowedMentions: &discordgo.MessageAllowedMentions{Users: reviewers},
-		}, discordgo.WithContext(ctx))
-		if err != nil {
-			slog.Error("lembrete: enviando mensagem", "err", err)
-			return
+	res.Reviewers = len(reviewers)
+	for _, reviewerID := range reviewers {
+		if err := r.sendDM(ctx, reviewerID, messageFor(len(byReviewer[reviewerID]), opt.Message)); err != nil {
+			slog.Warn("lembrete: DM falhou", "err", err, "guild_id", guildID, "reviewer", reviewerID)
+			res.Failed++
 		}
 	}
-	slog.Info("lembrete postado", "pendentes", len(merges), "responsaveis", len(reviewers))
+	slog.Info("lembrete enviado", "guild_id", guildID, "pendentes", res.Pending,
+		"responsaveis", res.Reviewers, "falhas", res.Failed)
+	return res, nil
 }
 
-// BuildMessages monta o texto do lembrete agrupado por responsável (na ordem
-// do pendente mais antigo de cada um), quebrado em mensagens de até 2000
-// caracteres. Também devolve os IDs dos responsáveis mencionados.
-func BuildMessages(merges []store.Merge, now time.Time) (messages []string, reviewers []string) {
+func (r *Reminder) sendDM(ctx context.Context, userID, content string) error {
+	ch, err := r.session.UserChannelCreate(userID, discordgo.WithContext(ctx))
+	if err != nil {
+		return fmt.Errorf("abrindo DM: %w", err)
+	}
+	_, err = r.session.ChannelMessageSendComplex(ch.ID, &discordgo.MessageSend{
+		Content:         content,
+		AllowedMentions: &discordgo.MessageAllowedMentions{},
+	}, discordgo.WithContext(ctx))
+	return err
+}
+
+func groupByReviewer(merges []store.Merge) ([]string, map[string][]store.Merge) {
+	var reviewers []string
 	byReviewer := map[string][]store.Merge{}
 	for _, m := range merges {
 		if _, ok := byReviewer[m.ReviewerID]; !ok {
@@ -67,46 +82,21 @@ func BuildMessages(merges []store.Merge, now time.Time) (messages []string, revi
 		}
 		byReviewer[m.ReviewerID] = append(byReviewer[m.ReviewerID], m)
 	}
-
-	lines := []string{"📋 **Lembrete semanal: merges pendentes**"}
-	for _, reviewerID := range reviewers {
-		items := byReviewer[reviewerID]
-		count := "1 pendente"
-		if len(items) > 1 {
-			count = fmt.Sprintf("%d pendentes", len(items))
-		}
-		lines = append(lines, "", fmt.Sprintf("<@%s>: %s", reviewerID, count))
-		for _, m := range items {
-			// <> evita o preview do link.
-			lines = append(lines, fmt.Sprintf("• #%d de <@%s>: <%s> (aberto %s)",
-				m.ID, m.AuthorID, m.MergeURL, bot.Age(m.CreatedAt, now)))
-		}
-	}
-	lines = append(lines, "", "Para dar baixa, use `/pendentes`.")
-
-	return splitLines(lines, maxMessageLen), reviewers
+	return reviewers, byReviewer
 }
 
-// splitLines junta as linhas em blocos de até limit caracteres sem quebrar
-// uma linha no meio (linhas maiores que limit são truncadas).
-func splitLines(lines []string, limit int) []string {
-	var out []string
-	var b strings.Builder
-	for _, line := range lines {
-		if len(line) > limit {
-			line = line[:limit]
-		}
-		if b.Len() > 0 && b.Len()+1+len(line) > limit {
-			out = append(out, b.String())
-			b.Reset()
-		}
-		if b.Len() > 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteString(line)
+const QuantityPlaceholder = "{quantidade}"
+
+func messageFor(n int, custom string) string {
+	if custom == "" {
+		return dmText(n)
 	}
-	if strings.TrimSpace(b.String()) != "" {
-		out = append(out, b.String())
+	return strings.ReplaceAll(custom, QuantityPlaceholder, strconv.Itoa(n))
+}
+
+func dmText(n int) string {
+	if n == 1 {
+		return "**Você tem 1 merge pendente de aprovação.**"
 	}
-	return out
+	return fmt.Sprintf("**Você tem %d merges pendentes de aprovação.**", n)
 }

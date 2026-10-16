@@ -1,75 +1,87 @@
 # Merge Bot
 
-Bot de Discord que registra merge requests pendentes da equipe e lembra o responsável de revisá-los.
+Bot de Discord para registrar merge requests pendentes e lembrar os responsáveis.
 
-- `/merge tarefa:<link> merge:<link> responsavel:@pessoa [obs:<texto>]` registra o merge e posta um anúncio mencionando o responsável.
-- `/pendentes [responsavel:@pessoa]` lista os pendentes, do mais antigo ao mais novo, 5 por mensagem, cada um com o botão **Mergeado #id**.
-- O botão só funciona para o responsável ou para quem tem permissão `Administrator` ou `Manage Server`. Ao concluir, o registro é excluído, o botão é desabilitado e o anúncio original fica verde com ✅.
-- Toda quarta às 09:00 (configurável), o bot posta no canal de lembrete os pendentes agrupados por responsável. Se não houver pendentes, não posta nada.
+## Criar a aplicação no Discord
 
-## Criando a aplicação no Discord
+1. Em [Discord Developer Portal](https://discord.com/developers/applications), clique em **New Application**.
+2. Em **Bot**, clique em **Reset Token** e guarde o token (`DISCORD_TOKEN`).
+3. Convide o bot para cada servidor com o link abaixo, trocando `<APP_ID>` pelo Application ID (aba **General Information**):
 
-1. Acesse o [Discord Developer Portal](https://discord.com/developers/applications) e clique em **New Application**.
-2. Em **Bot**, clique em **Reset Token** e copie o token para `DISCORD_TOKEN`. Nenhuma *Privileged Gateway Intent* precisa ser ligada.
-3. Em **OAuth2 → URL Generator**, marque:
-   - Escopos: `bot` e `applications.commands`
-   - Permissões do bot: **Send Messages** e **Embed Links** (opcionalmente **View Channels**, caso o cargo padrão não a tenha nos canais usados)
-4. Abra a URL gerada e convide o bot para o servidor.
-5. Com o modo desenvolvedor do Discord ligado (Configurações → Avançado), clique com o botão direito no servidor e em **Copiar ID** para obter `GUILD_ID`. Faça o mesmo no canal do lembrete para obter `REMINDER_CHANNEL_ID`.
+```
+https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot+applications.commands&permissions=19456
+```
 
-## Configuração
+## Variáveis de ambiente
 
-Variáveis de ambiente. Se existir um arquivo `.env` no diretório atual, ele é carregado (veja `.env.example`).
+Copie `.env.example` para `.env` e preencha.
 
 | Variável | Obrigatória | Padrão | Descrição |
 |---|---|---|---|
 | `DISCORD_TOKEN` | sim | | Token do bot |
-| `GUILD_ID` | sim | | Servidor onde os comandos são registrados |
-| `DB_PATH` | não | `./merges.db` (`/data/merges.db` no Docker) | Arquivo SQLite |
-| `REMINDER_CHANNEL_ID` | não | | Canal do lembrete semanal. Vazio desliga o lembrete. |
-| `REMINDER_CRON` | não | `0 9 * * 3` | Expressão cron (5 campos) do lembrete |
-| `TZ_NAME` | não | `America/Sao_Paulo` | Fuso do cron e das datas exibidas |
+| `DB_PATH` | não | `./merges.db` | Arquivo SQLite (no Docker é sempre `/data/merges.db`) |
+| `REMINDER_CRON` | não | `0 9 * * 3` | Cron padrão do lembrete para servidores sem `/config`. `off` desliga por padrão. |
+| `TZ_NAME` | não | `America/Sao_Paulo` | Fuso padrão para servidores sem `/config` |
 
-Os comandos são registrados na guild (`ApplicationCommandBulkOverwrite`) toda vez que o bot sobe, então aparecem na hora.
+## Comandos
 
-## Rodando localmente
+| Comando | Uso |
+|---|---|
+| `/merge responsavel [tarefa] [merge] [obs]` | Registra um merge. Informe ao menos a tarefa ou o merge; vários links separados por espaço. |
+| `/pendentes [responsavel] [criador]` | Lista os pendentes (só quem chamou vê). |
+| `/como_estamos [criador]` | Lista os pendentes em que você é o responsável. |
+| `/config conferir` | Mostra a configuração do lembrete do servidor. |
+| `/config lembrete [cron] [fuso] [ativo]` | Altera o lembrete. Intervalo mínimo de 1 hora. |
+| `/config testar-lembrete [mensagem] [usuario]` | Envia o lembrete agora. `{quantidade}` na mensagem vira o número de pendentes. |
 
-Requer Go 1.27+. Não precisa de CGO (o SQLite é `modernc.org/sqlite`).
+Botões: **Editar** e **Cancelar** (criador ou admin) e **Aprovar** (responsável ou admin). O `/config` é restrito a quem pode gerenciar o servidor.
+
+## Rodar localmente
+
+Requer Go 1.27+.
 
 ```sh
-cp .env.example .env   # preencha DISCORD_TOKEN e GUILD_ID
+cp .env.example .env
 go run ./cmd/bot
-```
-
-Testes:
-
-```sh
 go test ./...
 ```
 
-## Rodando com Docker
+## Deploy (VPS com Docker)
+
+Em uma VPS Linux com [Docker](https://docs.docker.com/engine/install/) instalado:
 
 ```sh
-docker build -t merge-bot .
-docker run -d --name merge-bot --restart unless-stopped \
-  --env-file .env \
-  -e DB_PATH=/data/merges.db \
-  -v merge-bot-data:/data \
-  merge-bot
+git clone git@github.com:HeitorFoltran/to-do-bot.git
+cd to-do-bot
+cp .env.example .env   # preencha DISCORD_TOKEN
+docker compose up -d --build
+docker compose logs -f
 ```
 
-O banco fica no volume `merge-bot-data`, então os pendentes sobrevivem a reinícios e atualizações da imagem. O bot encerra de forma limpa com `SIGINT`/`SIGTERM` (`docker stop`).
+Não rode o bot em dois lugares com o mesmo token: os comandos seriam respondidos duas vezes.
 
-Se usar `--env-file`, deixe `DB_PATH` fora do `.env` ou aponte para `/data/...`; a linha `-e DB_PATH=...` acima garante isso.
+Atualizar:
 
-## Estrutura
-
+```sh
+git pull
+docker compose up -d --build
 ```
-cmd/bot/main.go                 config, DB, sessão, registro de comandos, cron, shutdown
-internal/config/config.go       leitura e validação das env vars
-internal/store/store.go         acesso ao SQLite
-internal/bot/commands.go        definição e registro dos slash commands
-internal/bot/handlers.go        handlers de /merge, /pendentes e do botão
-internal/bot/embeds.go          embeds, botões e formatação de "há X"
-internal/reminder/reminder.go   lembrete semanal
+
+Alterar o `.env`: edite o arquivo e rode `docker compose up -d`.
+
+Backup do banco (o bot fica parado por alguns segundos, para o arquivo ficar consistente):
+
+```sh
+docker compose stop
+docker compose cp merge-bot:/data/merges.db ./backup-merges.db
+docker compose start
+```
+
+Para levar um banco existente para o servidor:
+
+```sh
+docker compose stop
+docker run --rm -v merge-bot-data:/data -v "$PWD":/src alpine \
+  sh -c 'cp /src/merges.db /data/merges.db && rm -f /data/merges.db-wal /data/merges.db-shm && chown 65532:65532 /data/merges.db'
+docker compose start
 ```

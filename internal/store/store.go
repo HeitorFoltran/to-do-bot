@@ -1,4 +1,3 @@
-// Package store faz o acesso ao SQLite onde ficam os merges pendentes.
 package store
 
 import (
@@ -6,12 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-// ErrNotFound indica que o merge não existe (ou já foi concluído).
 var ErrNotFound = errors.New("merge não encontrado")
 
 const schema = `
@@ -28,16 +27,22 @@ CREATE TABLE IF NOT EXISTS merges (
     created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_merges_reviewer ON merges(guild_id, reviewer_id);
+
+CREATE TABLE IF NOT EXISTS guild_settings (
+    guild_id         TEXT    PRIMARY KEY,
+    reminder_cron    TEXT    NOT NULL,
+    timezone         TEXT    NOT NULL,
+    reminder_enabled INTEGER NOT NULL
+);
 `
 
-// Merge é um merge request pendente de revisão.
 type Merge struct {
 	ID         int64
 	GuildID    string
 	AuthorID   string
 	ReviewerID string
-	TaskURL    string
-	MergeURL   string
+	TaskURLs   []string
+	MergeURLs  []string
 	Note       string
 	ChannelID  string
 	MessageID  string
@@ -48,8 +53,6 @@ type Store struct {
 	db *sql.DB
 }
 
-// Open abre (ou cria) o banco em path e aplica a migração.
-// Use ":memory:" para um banco em memória.
 func Open(path string) (*Store, error) {
 	dsn := path
 	if path != ":memory:" {
@@ -59,7 +62,7 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("abrindo sqlite: %w", err)
 	}
-	// Uma conexão só: evita SQLITE_BUSY e mantém o mesmo banco no modo :memory:.
+
 	db.SetMaxOpenConns(1)
 
 	if _, err := db.Exec(schema); err != nil {
@@ -73,7 +76,6 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// Create insere o merge e devolve o id gerado. CreatedAt zero vira o horário atual.
 func (s *Store) Create(ctx context.Context, m *Merge) (int64, error) {
 	createdAt := m.CreatedAt
 	if createdAt.IsZero() {
@@ -82,7 +84,7 @@ func (s *Store) Create(ctx context.Context, m *Merge) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO merges (guild_id, author_id, reviewer_id, task_url, merge_url, note, channel_id, message_id, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.GuildID, m.AuthorID, m.ReviewerID, m.TaskURL, m.MergeURL,
+		m.GuildID, m.AuthorID, m.ReviewerID, joinURLs(m.TaskURLs), joinURLs(m.MergeURLs),
 		nullString(m.Note), m.ChannelID, nullString(m.MessageID), formatTime(createdAt),
 	)
 	if err != nil {
@@ -97,7 +99,6 @@ func (s *Store) Create(ctx context.Context, m *Merge) (int64, error) {
 	return id, nil
 }
 
-// Get busca um merge pelo id. Retorna ErrNotFound se não existir.
 func (s *Store) Get(ctx context.Context, id int64) (*Merge, error) {
 	row := s.db.QueryRowContext(ctx, selectCols+` WHERE id = ?`, id)
 	m, err := scanMerge(row)
@@ -110,14 +111,57 @@ func (s *Store) Get(ctx context.Context, id int64) (*Merge, error) {
 	return m, nil
 }
 
-// ListPending lista os merges do servidor, do mais antigo ao mais novo.
-// reviewerID vazio lista todos.
-func (s *Store) ListPending(ctx context.Context, guildID, reviewerID string) ([]Merge, error) {
+type Settings struct {
+	GuildID         string
+	ReminderCron    string
+	Timezone        string
+	ReminderEnabled bool
+}
+
+func (s *Store) GetSettings(ctx context.Context, guildID string) (*Settings, error) {
+	st := Settings{GuildID: guildID}
+	err := s.db.QueryRowContext(ctx,
+		`SELECT reminder_cron, timezone, reminder_enabled FROM guild_settings WHERE guild_id = ?`, guildID,
+	).Scan(&st.ReminderCron, &st.Timezone, &st.ReminderEnabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("buscando configuração do servidor %s: %w", guildID, err)
+	}
+	return &st, nil
+}
+
+func (s *Store) SaveSettings(ctx context.Context, st *Settings) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO guild_settings (guild_id, reminder_cron, timezone, reminder_enabled)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (guild_id) DO UPDATE SET
+			reminder_cron = excluded.reminder_cron,
+			timezone = excluded.timezone,
+			reminder_enabled = excluded.reminder_enabled`,
+		st.GuildID, st.ReminderCron, st.Timezone, st.ReminderEnabled)
+	if err != nil {
+		return fmt.Errorf("gravando configuração do servidor %s: %w", st.GuildID, err)
+	}
+	return nil
+}
+
+type Filter struct {
+	ReviewerID string
+	AuthorID   string
+}
+
+func (s *Store) ListPending(ctx context.Context, guildID string, f Filter) ([]Merge, error) {
 	query := selectCols + ` WHERE guild_id = ?`
 	args := []any{guildID}
-	if reviewerID != "" {
+	if f.ReviewerID != "" {
 		query += ` AND reviewer_id = ?`
-		args = append(args, reviewerID)
+		args = append(args, f.ReviewerID)
+	}
+	if f.AuthorID != "" {
+		query += ` AND author_id = ?`
+		args = append(args, f.AuthorID)
 	}
 	query += ` ORDER BY created_at ASC, id ASC`
 
@@ -138,7 +182,6 @@ func (s *Store) ListPending(ctx context.Context, guildID, reviewerID string) ([]
 	return out, rows.Err()
 }
 
-// Delete exclui o merge. Retorna ErrNotFound se ele já não existia.
 func (s *Store) Delete(ctx context.Context, id int64) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM merges WHERE id = ?`, id)
 	if err != nil {
@@ -154,7 +197,19 @@ func (s *Store) Delete(ctx context.Context, id int64) error {
 	return nil
 }
 
-// SetMessageID grava a mensagem de anúncio do merge.
+func (s *Store) Update(ctx context.Context, m *Merge) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE merges SET reviewer_id = ?, task_url = ?, merge_url = ?, note = ? WHERE id = ?`,
+		m.ReviewerID, joinURLs(m.TaskURLs), joinURLs(m.MergeURLs), nullString(m.Note), m.ID)
+	if err != nil {
+		return fmt.Errorf("atualizando merge %d: %w", m.ID, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) SetMessageID(ctx context.Context, id int64, channelID, messageID string) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE merges SET channel_id = ?, message_id = ? WHERE id = ?`, channelID, messageID, id)
@@ -176,11 +231,13 @@ type scanner interface {
 
 func scanMerge(sc scanner) (*Merge, error) {
 	var m Merge
-	var createdAt string
-	if err := sc.Scan(&m.ID, &m.GuildID, &m.AuthorID, &m.ReviewerID, &m.TaskURL, &m.MergeURL,
+	var taskURLs, mergeURLs, createdAt string
+	if err := sc.Scan(&m.ID, &m.GuildID, &m.AuthorID, &m.ReviewerID, &taskURLs, &mergeURLs,
 		&m.Note, &m.ChannelID, &m.MessageID, &createdAt); err != nil {
 		return nil, err
 	}
+	m.TaskURLs = splitURLs(taskURLs)
+	m.MergeURLs = splitURLs(mergeURLs)
 	t, err := parseTime(createdAt)
 	if err != nil {
 		return nil, err
@@ -189,8 +246,6 @@ func scanMerge(sc scanner) (*Merge, error) {
 	return &m, nil
 }
 
-// Datas ficam no formato do CURRENT_TIMESTAMP do SQLite (UTC), que ordena
-// corretamente como texto.
 const timeLayout = "2006-01-02 15:04:05"
 
 func formatTime(t time.Time) string {
@@ -204,6 +259,14 @@ func parseTime(s string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("created_at inválido: %q", s)
+}
+
+func joinURLs(urls []string) string {
+	return strings.Join(urls, "\n")
+}
+
+func splitURLs(s string) []string {
+	return strings.Fields(s)
 }
 
 func nullString(s string) sql.NullString {

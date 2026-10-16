@@ -1,4 +1,3 @@
-// Package bot contém os slash commands, handlers e embeds do Discord.
 package bot
 
 import (
@@ -8,32 +7,42 @@ import (
 	"log/slog"
 	"net/url"
 	"runtime/debug"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/bwmarrin/discordgo"
 
+	"merge-bot/internal/reminder"
 	"merge-bot/internal/store"
 )
 
-// itemsPerMessage respeita os limites do Discord (10 embeds e 5 action rows).
-const itemsPerMessage = 5
+const (
+	itemsPerMessage = 5
+	maxPageChars    = 3500
+)
 
 const dbTimeout = 5 * time.Second
 
 type Handler struct {
-	store *store.Store
-	loc   *time.Location
-	now   func() time.Time
+	store    *store.Store
+	rem      *reminder.Reminder
+	sched    *reminder.Scheduler
+	defaults store.Settings
+
+	registered sync.Map
 }
 
-func NewHandler(st *store.Store, loc *time.Location) *Handler {
-	return &Handler{store: st, loc: loc, now: time.Now}
+func NewHandler(st *store.Store, rem *reminder.Reminder, sched *reminder.Scheduler, defaults store.Settings) *Handler {
+	return &Handler{store: st, rem: rem, sched: sched, defaults: defaults}
 }
 
-// OnInteraction é registrado com session.AddHandler. Um panic num handler
-// é recuperado e logado para não derrubar o processo.
+func (h *Handler) settings(ctx context.Context, guildID string) (store.Settings, error) {
+	return reminder.LoadSettings(ctx, h.store, guildID, h.defaults)
+}
+
 func (h *Handler) OnInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -54,30 +63,59 @@ func (h *Handler) OnInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 			h.handleMerge(s, i)
 		case cmdPendentes:
 			h.handlePendentes(s, i)
+		case cmdComoEstamos:
+			h.handleComoEstamos(s, i)
+		case cmdConfig:
+			h.handleConfig(s, i)
 		default:
 			slog.Warn("comando desconhecido", "name", name)
 			respondEphemeral(s, i, "Comando desconhecido.")
 		}
 	case discordgo.InteractionMessageComponent:
 		customID := i.MessageComponentData().CustomID
-		if strings.HasPrefix(customID, doneButtonPrefix) {
-			h.handleDoneButton(s, i)
+		action, id, ok := parseActionID(customID)
+		if !ok {
+			slog.Warn("componente desconhecido", "custom_id", customID)
+			respondEphemeral(s, i, "Ação desconhecida.")
 			return
 		}
-		slog.Warn("componente desconhecido", "custom_id", customID)
+		switch action {
+		case actDone:
+			h.handleDoneButton(s, i, id)
+		case actEdit:
+			h.handleEditButton(s, i, id)
+		case actEditLinks:
+			h.handleEditLinksButton(s, i, id)
+		case actEditReviewer:
+			h.handleEditReviewer(s, i, id)
+		case actCancel:
+			h.handleCancelButton(s, i, id)
+		case actCancelConfirm:
+			h.handleCancelConfirm(s, i, id)
+		default:
+			slog.Warn("ação desconhecida", "custom_id", customID)
+			respondEphemeral(s, i, "Ação desconhecida.")
+		}
+	case discordgo.InteractionModalSubmit:
+		customID := i.ModalSubmitData().CustomID
+		if action, id, ok := parseActionID(customID); ok && action == actEditModal {
+			h.handleEditModal(s, i, id)
+			return
+		}
+		slog.Warn("modal desconhecido", "custom_id", customID)
 		respondEphemeral(s, i, "Ação desconhecida.")
 	}
 }
 
 func (h *Handler) handleMerge(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	data := i.ApplicationCommandData()
-	var taskURL, mergeURL, reviewerID, note string
+	var rawTasks, rawMerges, reviewerID, note string
 	for _, opt := range data.Options {
 		switch opt.Name {
 		case optTarefa:
-			taskURL = strings.TrimSpace(opt.StringValue())
+			rawTasks = opt.StringValue()
 		case optMerge:
-			mergeURL = strings.TrimSpace(opt.StringValue())
+			rawMerges = opt.StringValue()
 		case optResponsavel:
 			reviewerID = opt.UserValue(nil).ID
 		case optObs:
@@ -85,12 +123,9 @@ func (h *Handler) handleMerge(s *discordgo.Session, i *discordgo.InteractionCrea
 		}
 	}
 
-	if err := validateURL(taskURL); err != nil {
-		respondEphemeral(s, i, fmt.Sprintf("Link da tarefa inválido: %v", err))
-		return
-	}
-	if err := validateURL(mergeURL); err != nil {
-		respondEphemeral(s, i, fmt.Sprintf("Link do merge inválido: %v", err))
+	taskURLs, mergeURLs, problem := parseLinks(rawTasks, rawMerges)
+	if problem != "" {
+		respondEphemeral(s, i, problem)
 		return
 	}
 	if utf8.RuneCountInString(note) > maxNoteLen {
@@ -110,8 +145,8 @@ func (h *Handler) handleMerge(s *discordgo.Session, i *discordgo.InteractionCrea
 		GuildID:    i.GuildID,
 		AuthorID:   i.Member.User.ID,
 		ReviewerID: reviewerID,
-		TaskURL:    taskURL,
-		MergeURL:   mergeURL,
+		TaskURLs:   taskURLs,
+		MergeURLs:  mergeURLs,
 		Note:       note,
 		ChannelID:  i.ChannelID,
 	}
@@ -126,14 +161,13 @@ func (h *Handler) handleMerge(s *discordgo.Session, i *discordgo.InteractionCrea
 	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf("%s, %s abriu um merge para você revisar.", mention(reviewerID), mention(m.AuthorID)),
-			Embeds:  []*discordgo.MessageEmbed{announcementEmbed(m)},
-			// Só o responsável é notificado.
-			AllowedMentions: &discordgo.MessageAllowedMentions{Users: []string{reviewerID}},
+			Embeds:     []*discordgo.MessageEmbed{announcementEmbed(m)},
+			Components: announcementComponents(m, ""),
+
+			AllowedMentions: &discordgo.MessageAllowedMentions{},
 		},
 	})
 	if err != nil {
-		// Sem anúncio o usuário vai tentar de novo; desfaz para não duplicar.
 		slog.Error("respondendo /merge", "err", err, "merge_id", m.ID)
 		if derr := h.store.Delete(ctx, m.ID); derr != nil {
 			slog.Error("desfazendo merge", "err", derr, "merge_id", m.ID)
@@ -152,50 +186,57 @@ func (h *Handler) handleMerge(s *discordgo.Session, i *discordgo.InteractionCrea
 	slog.Info("merge registrado", "merge_id", m.ID, "author", m.AuthorID, "reviewer", reviewerID)
 }
 
-func (h *Handler) handlePendentes(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	var reviewerID string
-	if opt := i.ApplicationCommandData().GetOption(optResponsavel); opt != nil {
-		reviewerID = opt.UserValue(nil).ID
-	}
+func (h *Handler) handleComoEstamos(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	h.listPending(s, i, store.Filter{
+		ReviewerID: i.Member.User.ID,
+		AuthorID:   userOption(i, optCriador),
+	})
+}
 
+func (h *Handler) handlePendentes(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	h.listPending(s, i, store.Filter{
+		ReviewerID: userOption(i, optResponsavel),
+		AuthorID:   userOption(i, optCriador),
+	})
+}
+
+func userOption(i *discordgo.InteractionCreate, name string) string {
+	if opt := i.ApplicationCommandData().GetOption(name); opt != nil {
+		return opt.UserValue(nil).ID
+	}
+	return ""
+}
+
+func (h *Handler) listPending(s *discordgo.Session, i *discordgo.InteractionCreate, f store.Filter) {
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
-	merges, err := h.store.ListPending(ctx, i.GuildID, reviewerID)
+	merges, err := h.store.ListPending(ctx, i.GuildID, f)
 	if err != nil {
 		slog.Error("listando pendentes", "err", err)
-		respondEphemeral(s, i, "Não consegui listar os merges. Tente de novo.")
+		respondEphemeral(s, i, "Não foi possível listar os merges. Tente de novo.")
 		return
 	}
 	if len(merges) == 0 {
-		respondEphemeral(s, i, "Nenhum merge pendente 🎉")
+		respondEphemeral(s, i, "Nenhum merge pendente")
 		return
 	}
 
-	now := h.now()
-	noMentions := &discordgo.MessageAllowedMentions{}
-	for n, group := range chunk(merges, itemsPerMessage) {
-		embeds := make([]*discordgo.MessageEmbed, 0, len(group))
-		rows := make([]discordgo.MessageComponent, 0, len(group))
-		for k := range group {
-			embeds = append(embeds, pendingEmbed(&group[k], now, h.loc))
-			rows = append(rows, doneButtonRow(&group[k]))
-		}
+	loc := time.UTC
+	if gs, err := h.settings(ctx, i.GuildID); err != nil {
+		slog.Warn("lendo configuração do servidor", "err", err, "guild_id", i.GuildID)
+	} else if l, err := time.LoadLocation(gs.Timezone); err == nil {
+		loc = l
+	}
 
+	flags := discordgo.MessageFlagsEphemeral | discordgo.MessageFlagsIsComponentsV2
+	for n, components := range pendingPages(merges, loc, pendingHeader(len(merges), f), i.Member.User.ID) {
 		if n == 0 {
-			err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-				Type: discordgo.InteractionResponseChannelMessageWithSource,
-				Data: &discordgo.InteractionResponseData{
-					Content:         pendingHeader(len(merges), reviewerID),
-					Embeds:          embeds,
-					Components:      rows,
-					AllowedMentions: noMentions,
-				},
-			})
+			err = respondComponents(s, i, discordgo.InteractionResponseChannelMessageWithSource, components, flags)
 		} else {
 			_, err = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-				Embeds:          embeds,
-				Components:      rows,
-				AllowedMentions: noMentions,
+				Components:      components,
+				Flags:           flags,
+				AllowedMentions: &discordgo.MessageAllowedMentions{},
 			})
 		}
 		if err != nil {
@@ -205,26 +246,26 @@ func (h *Handler) handlePendentes(s *discordgo.Session, i *discordgo.Interaction
 	}
 }
 
-func pendingHeader(total int, reviewerID string) string {
+func pendingHeader(total int, f store.Filter) string {
 	var b strings.Builder
 	if total == 1 {
 		b.WriteString("**1 merge pendente**")
 	} else {
 		fmt.Fprintf(&b, "**%d merges pendentes**", total)
 	}
-	if reviewerID != "" {
-		b.WriteString(" para " + mention(reviewerID))
+	if f.ReviewerID != "" {
+		b.WriteString(" para ")
+		b.WriteString(mention(f.ReviewerID))
+	}
+	if f.AuthorID != "" {
+		b.WriteString(" abertos por ")
+		b.WriteString(mention(f.AuthorID))
 	}
 	return b.String()
 }
 
-func (h *Handler) handleDoneButton(s *discordgo.Session, i *discordgo.InteractionCreate) {
+func (h *Handler) handleDoneButton(s *discordgo.Session, i *discordgo.InteractionCreate, id int64) {
 	customID := i.MessageComponentData().CustomID
-	id, ok := parseDoneButtonID(customID)
-	if !ok {
-		respondEphemeral(s, i, "Botão inválido.")
-		return
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -256,25 +297,33 @@ func (h *Handler) handleDoneButton(s *discordgo.Session, i *discordgo.Interactio
 	}
 	slog.Info("merge concluído", "merge_id", id, "by", user.ID)
 
-	name := i.Member.DisplayName()
-	if err := updateClickedMessage(s, i, customID, "✅ Mergeado por "+name); err != nil {
+	doneLabel := "Aprovado por " + i.Member.DisplayName()
+	doneEmbeds := []*discordgo.MessageEmbed{announcementDoneEmbed(m, mention(user.ID))}
+	doneComponents := announcementComponents(m, doneLabel)
+
+	if m.MessageID != "" && i.Message.ID == m.MessageID {
+		err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseUpdateMessage,
+			Data: &discordgo.InteractionResponseData{
+				Embeds:          doneEmbeds,
+				Components:      doneComponents,
+				AllowedMentions: &discordgo.MessageAllowedMentions{},
+			},
+		})
+		if err != nil {
+			slog.Error("atualizando anúncio", "err", err, "merge_id", id)
+		}
+		return
+	}
+
+	if err := updateClickedMessage(s, i, customID, doneLabel); err != nil {
 		slog.Error("atualizando mensagem da lista", "err", err, "merge_id", id)
 	}
-
-	if m.MessageID != "" {
-		edit := discordgo.NewMessageEdit(m.ChannelID, m.MessageID).
-			SetEmbeds([]*discordgo.MessageEmbed{announcementDoneEmbed(m, mention(user.ID))})
-		edit.AllowedMentions = &discordgo.MessageAllowedMentions{}
-		if _, err := s.ChannelMessageEditComplex(edit); err != nil {
-			slog.Warn("editando anúncio original", "err", err, "merge_id", id)
-		}
-	}
+	h.editAnnouncement(s, m, doneEmbeds[0], doneComponents)
 }
 
-// respondAlreadyDone desabilita o botão clicado e avisa, em ephemeral, que o
-// merge já foi concluído.
 func (h *Handler) respondAlreadyDone(s *discordgo.Session, i *discordgo.InteractionCreate, customID string) {
-	if err := updateClickedMessage(s, i, customID, "✅ Concluído"); err != nil {
+	if err := updateClickedMessage(s, i, customID, "Concluído"); err != nil {
 		slog.Error("desabilitando botão", "err", err)
 		respondEphemeral(s, i, "Esse merge já foi concluído")
 		return
@@ -287,21 +336,73 @@ func (h *Handler) respondAlreadyDone(s *discordgo.Session, i *discordgo.Interact
 	}
 }
 
-// updateClickedMessage responde a interação alterando só o botão clicado.
 func updateClickedMessage(s *discordgo.Session, i *discordgo.InteractionCreate, customID, label string) error {
-	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseUpdateMessage,
-		Data: &discordgo.InteractionResponseData{
-			Content:         i.Message.Content,
-			Embeds:          i.Message.Embeds,
-			Components:      disableButton(i.Message.Components, customID, label),
-			AllowedMentions: &discordgo.MessageAllowedMentions{},
-		},
-	})
+	return respondComponents(s, i, discordgo.InteractionResponseUpdateMessage,
+		disableButton(i.Message.Components, customID, label),
+		i.Message.Flags&discordgo.MessageFlagsIsComponentsV2)
+}
+
+func respondComponents(s *discordgo.Session, i *discordgo.InteractionCreate, typ discordgo.InteractionResponseType,
+	components []discordgo.MessageComponent, flags discordgo.MessageFlags) error {
+	type data struct {
+		Components      []discordgo.MessageComponent      `json:"components"`
+		Flags           discordgo.MessageFlags            `json:"flags,omitempty"`
+		AllowedMentions *discordgo.MessageAllowedMentions `json:"allowed_mentions"`
+	}
+	body := struct {
+		Type discordgo.InteractionResponseType `json:"type"`
+		Data data                              `json:"data"`
+	}{typ, data{components, flags, &discordgo.MessageAllowedMentions{}}}
+
+	endpoint := discordgo.EndpointInteractionResponse(i.ID, i.Token)
+	_, err := s.RequestWithBucketID("POST", endpoint, body, endpoint)
+	return err
 }
 
 func isManager(m *discordgo.Member) bool {
 	return m.Permissions&(discordgo.PermissionAdministrator|discordgo.PermissionManageGuild) != 0
+}
+
+func parseLinks(rawTasks, rawMerges string) (taskURLs, mergeURLs []string, problem string) {
+	taskURLs, err := parseOptionalURLs(rawTasks)
+	if err != nil {
+		return nil, nil, fmt.Sprintf("Link da tarefa inválido: %v", err)
+	}
+	mergeURLs, err = parseOptionalURLs(rawMerges)
+	if err != nil {
+		return nil, nil, fmt.Sprintf("Link do merge inválido: %v", err)
+	}
+	if len(taskURLs) == 0 && len(mergeURLs) == 0 {
+		return nil, nil, "Informe ao menos o link da tarefa ou o do merge."
+	}
+	return taskURLs, mergeURLs, ""
+}
+
+func parseOptionalURLs(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	return parseURLs(raw)
+}
+
+func parseURLs(raw string) ([]string, error) {
+	var urls []string
+	for _, field := range strings.Fields(raw) {
+		u := strings.TrimRight(field, ",;")
+		if u == "" {
+			continue
+		}
+		if err := validateURL(u); err != nil {
+			return nil, fmt.Errorf("%s: %w", u, err)
+		}
+		if !slices.Contains(urls, u) {
+			urls = append(urls, u)
+		}
+	}
+	if len(urls) == 0 {
+		return nil, errors.New("vazio")
+	}
+	return urls, nil
 }
 
 func validateURL(raw string) error {
