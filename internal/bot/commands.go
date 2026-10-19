@@ -2,6 +2,7 @@ package bot
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -11,6 +12,7 @@ const (
 	cmdPendentes   = "pendentes"
 	cmdComoEstamos = "como_estamos"
 	cmdConfig      = "config"
+	cmdHelp        = "help"
 
 	subConferir       = "conferir"
 	subLembrete       = "lembrete"
@@ -25,11 +27,9 @@ const (
 
 	maxTestMessageLen = 1000
 
-	optTarefa      = "tarefa"
-	optMerge       = "merge"
 	optResponsavel = "responsavel"
 	optCriador     = "criador"
-	optObs         = "obs"
+	optDDL         = "ddl"
 
 	maxNoteLen = 200
 	maxURLLen  = 800
@@ -38,7 +38,7 @@ const (
 var Commands = []*discordgo.ApplicationCommand{
 	{
 		Name:        cmdMerge,
-		Description: "Registra um merge request pendente de revisão",
+		Description: "Registra um merge request pendente de revisão (links, obs e DDL no formulário)",
 		Options: []*discordgo.ApplicationCommandOption{
 			{
 				Type:        discordgo.ApplicationCommandOptionUser,
@@ -47,22 +47,9 @@ var Commands = []*discordgo.ApplicationCommand{
 				Required:    true,
 			},
 			{
-				Type:        discordgo.ApplicationCommandOptionString,
-				Name:        optTarefa,
-				Description: "Link(s) da tarefa, separados por espaço (opcional se informar o merge)",
-				MaxLength:   maxURLLen,
-			},
-			{
-				Type:        discordgo.ApplicationCommandOptionString,
-				Name:        optMerge,
-				Description: "Link(s) do merge request, separados por espaço (opcional se informar a tarefa)",
-				MaxLength:   maxURLLen,
-			},
-			{
-				Type:        discordgo.ApplicationCommandOptionString,
-				Name:        optObs,
-				Description: "Observação",
-				MaxLength:   maxNoteLen,
+				Type:        discordgo.ApplicationCommandOptionAttachment,
+				Name:        optDDL,
+				Description: "Arquivo com a DDL (opcional)",
 			},
 		},
 	},
@@ -148,6 +135,49 @@ var Commands = []*discordgo.ApplicationCommand{
 			},
 		},
 	},
+}
+
+func init() {
+	Commands = append(Commands, &discordgo.ApplicationCommand{
+		Name:        cmdHelp,
+		Description: "Lista os comandos do bot",
+	})
+}
+
+// helpText monta a ajuda a partir de Commands, para não sair de sincronia.
+func helpText() string {
+	var b strings.Builder
+	b.WriteString("**Comandos**\n")
+	for _, c := range Commands {
+		admin := ""
+		if c.DefaultMemberPermissions != nil {
+			admin = " *(admin)*"
+		}
+		subs := 0
+		for _, o := range c.Options {
+			if o.Type == discordgo.ApplicationCommandOptionSubCommand {
+				subs++
+				fmt.Fprintf(&b, "`/%s %s%s` — %s%s\n", c.Name, o.Name, usage(o.Options), o.Description, admin)
+			}
+		}
+		if subs == 0 {
+			fmt.Fprintf(&b, "`/%s%s` — %s%s\n", c.Name, usage(c.Options), c.Description, admin)
+		}
+	}
+	b.WriteString("\nOpções entre [colchetes] são opcionais.")
+	return b.String()
+}
+
+func usage(opts []*discordgo.ApplicationCommandOption) string {
+	var b strings.Builder
+	for _, o := range opts {
+		if o.Required {
+			fmt.Fprintf(&b, " %s", o.Name)
+		} else {
+			fmt.Fprintf(&b, " [%s]", o.Name)
+		}
+	}
+	return b.String()
 }
 
 var manageGuild int64 = discordgo.PermissionManageGuild

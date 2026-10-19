@@ -30,12 +30,13 @@ Copie `.env.example` para `.env` e preencha.
 
 | Comando | Uso |
 |---|---|
-| `/merge responsavel [tarefa] [merge] [obs]` | Registra um merge. Informe ao menos a tarefa ou o merge; vários links separados por espaço. |
+| `/merge responsavel [ddl]` | Abre um formulário para os links da tarefa e do merge (um por linha), a obs e a DDL. Informe ao menos a tarefa ou o merge. A DDL pode ir como arquivo na opção `ddl` (até 8 MB) ou colada no formulário (até 4000 caracteres); ela fica anexada ao anúncio. |
 | `/pendentes [responsavel] [criador]` | Lista os pendentes (só quem chamou vê). |
 | `/como_estamos [criador]` | Lista os pendentes em que você é o responsável. |
 | `/config conferir` | Mostra a configuração do lembrete do servidor. |
 | `/config lembrete [cron] [fuso] [ativo]` | Altera o lembrete. Intervalo mínimo de 1 hora. |
 | `/config testar-lembrete [mensagem] [usuario]` | Envia o lembrete agora. `{quantidade}` na mensagem vira o número de pendentes. |
+| `/help` | Lista os comandos (só quem chamou vê). |
 
 Botões: **Editar** e **Cancelar** (criador ou admin) e **Aprovar** (responsável ou admin). O `/config` é restrito a quem pode gerenciar o servidor.
 

@@ -17,6 +17,7 @@ const (
 	inputTarefa = "tarefa"
 	inputMerge  = "merge"
 	inputObs    = "obs"
+	inputDDL    = "ddl"
 )
 
 func (h *Handler) loadForOwner(s *discordgo.Session, i *discordgo.InteractionCreate, id int64, verb string) (*store.Merge, bool) {
@@ -89,33 +90,60 @@ func (h *Handler) handleEditLinksButton(s *discordgo.Session, i *discordgo.Inter
 	if !ok {
 		return
 	}
-	textInput := func(customID, label, value string, required bool, maxLen int) discordgo.MessageComponent {
+	err := s.InteractionRespond(i.Interaction, linksModal(actionID(actEditModal, m.ID), fmt.Sprintf("Editar merge #%d", m.ID),
+		"DDL nova (vazio mantém a atual)", m.TaskURLs, m.MergeURLs, m.Note))
+	if err != nil {
+		slog.Error("abrindo modal de edição", "err", err, "merge_id", id)
+	}
+}
+
+func linksModal(customID, title, ddlLabel string, taskURLs, mergeURLs []string, note string) *discordgo.InteractionResponse {
+	textInput := func(customID, label, value string, maxLen int) discordgo.MessageComponent {
 		return discordgo.ActionsRow{Components: []discordgo.MessageComponent{
 			discordgo.TextInput{
 				CustomID:  customID,
 				Label:     label,
 				Style:     discordgo.TextInputParagraph,
 				Value:     value,
-				Required:  required,
 				MaxLength: maxLen,
 			},
 		}}
 	}
-	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+	return &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseModal,
 		Data: &discordgo.InteractionResponseData{
-			CustomID: actionID(actEditModal, m.ID),
-			Title:    fmt.Sprintf("Editar merge #%d", m.ID),
+			CustomID: customID,
+			Title:    title,
 			Components: []discordgo.MessageComponent{
-				textInput(inputTarefa, "Tarefa(s), um link por linha", strings.Join(m.TaskURLs, "\n"), false, maxURLLen),
-				textInput(inputMerge, "Merge(s), um link por linha", strings.Join(m.MergeURLs, "\n"), false, maxURLLen),
-				textInput(inputObs, "Obs", m.Note, false, maxNoteLen),
+				textInput(inputTarefa, "Tarefa(s), um link por linha", strings.Join(taskURLs, "\n"), maxURLLen),
+				textInput(inputMerge, "Merge(s), um link por linha", strings.Join(mergeURLs, "\n"), maxURLLen),
+				textInput(inputObs, "Obs", note, maxNoteLen),
+				textInput(inputDDL, ddlLabel, "", maxDDLLen),
 			},
 		},
-	})
-	if err != nil {
-		slog.Error("abrindo modal de edição", "err", err, "merge_id", id)
 	}
+}
+
+type linksForm struct {
+	taskURLs, mergeURLs []string
+	note, ddl           string
+}
+
+func parseLinksModal(i *discordgo.InteractionCreate) (linksForm, string) {
+	values := modalValues(i.ModalSubmitData().Components)
+	taskURLs, mergeURLs, problem := parseLinks(values[inputTarefa], values[inputMerge])
+	if problem != "" {
+		return linksForm{}, problem
+	}
+	note := strings.TrimSpace(values[inputObs])
+	if utf8.RuneCountInString(note) > maxNoteLen {
+		return linksForm{}, fmt.Sprintf("A observação pode ter no máximo %d caracteres.", maxNoteLen)
+	}
+	ddl := strings.TrimSpace(values[inputDDL])
+	if utf8.RuneCountInString(ddl) > maxDDLLen {
+		return linksForm{}, fmt.Sprintf("A DDL colada pode ter no máximo %d caracteres. Para mais, anexe um arquivo no /merge.", maxDDLLen)
+	}
+	return linksForm{taskURLs: taskURLs, mergeURLs: mergeURLs, note: note, ddl: ddl}, ""
 }
 
 func (h *Handler) handleEditModal(s *discordgo.Session, i *discordgo.InteractionCreate, id int64) {
@@ -123,25 +151,39 @@ func (h *Handler) handleEditModal(s *discordgo.Session, i *discordgo.Interaction
 	if !ok {
 		return
 	}
-	values := modalValues(i.ModalSubmitData().Components)
-
-	taskURLs, mergeURLs, msg := parseLinks(values[inputTarefa], values[inputMerge])
+	form, msg := parseLinksModal(i)
 	if msg != "" {
 		respondEphemeral(s, i, msg)
 		return
 	}
-	note := strings.TrimSpace(values[inputObs])
-	if utf8.RuneCountInString(note) > maxNoteLen {
-		respondEphemeral(s, i, fmt.Sprintf("A observação pode ter no máximo %d caracteres.", maxNoteLen))
+	if form.ddl != "" && m.MessageID == "" {
+		respondEphemeral(s, i, "Não encontrei o anúncio deste merge para anexar a DDL.")
 		return
 	}
 
-	m.TaskURLs, m.MergeURLs, m.Note = taskURLs, mergeURLs, note
+	hadDDL := m.HasDDL
+	m.TaskURLs, m.MergeURLs, m.Note = form.taskURLs, form.mergeURLs, form.note
+	m.HasDDL = hadDDL || form.ddl != ""
 	if !h.saveEdit(s, i, m) {
 		return
 	}
-	h.updatePanel(s, i, fmt.Sprintf("Links e obs do merge #%d atualizados.", m.ID), editPanel(m))
-	h.refreshAnnouncement(s, m)
+	if form.ddl == "" {
+		h.updatePanel(s, i, fmt.Sprintf("Links e obs do merge #%d atualizados.", m.ID), editPanel(m))
+		h.refreshAnnouncement(s, m)
+		return
+	}
+
+	content := fmt.Sprintf("Links, obs e DDL do merge #%d atualizados.", m.ID)
+	files := []*discordgo.File{ddlFile(m.ID, form.ddl)}
+	if err := h.editAnnouncement(s, m, announcementEmbed(m), announcementComponents(m, ""), files); err != nil {
+		content = fmt.Sprintf("Links e obs do merge #%d atualizados, mas não consegui trocar a DDL no anúncio. Tente de novo.", m.ID)
+		if !hadDDL {
+			m.HasDDL = false
+			h.saveEditQuiet(m)
+			h.refreshAnnouncement(s, m)
+		}
+	}
+	h.updatePanel(s, i, content, editPanel(m))
 }
 
 func (h *Handler) handleEditReviewer(s *discordgo.Session, i *discordgo.InteractionCreate, id int64) {
@@ -183,6 +225,14 @@ func (h *Handler) saveEdit(s *discordgo.Session, i *discordgo.InteractionCreate,
 	}
 	slog.Info("merge editado", "merge_id", m.ID, "by", i.Member.User.ID)
 	return true
+}
+
+func (h *Handler) saveEditQuiet(m *store.Merge) {
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+	if err := h.store.Update(ctx, m); err != nil {
+		slog.Error("desfazendo has_ddl", "err", err, "merge_id", m.ID)
+	}
 }
 
 func (h *Handler) handleCancelButton(s *discordgo.Session, i *discordgo.InteractionCreate, id int64) {
@@ -233,7 +283,7 @@ func (h *Handler) handleCancelConfirm(s *discordgo.Session, i *discordgo.Interac
 	h.updatePanel(s, i, fmt.Sprintf("Merge #%d cancelado.", m.ID), nil)
 	h.editAnnouncement(s, m,
 		announcementCancelledEmbed(m, mention(i.Member.User.ID)),
-		announcementComponents(m, "Cancelado por "+i.Member.DisplayName()))
+		announcementComponents(m, "Cancelado por "+i.Member.DisplayName()), nil)
 }
 
 func (h *Handler) updatePanel(s *discordgo.Session, i *discordgo.InteractionCreate, content string, components []discordgo.MessageComponent) {
@@ -254,19 +304,26 @@ func (h *Handler) updatePanel(s *discordgo.Session, i *discordgo.InteractionCrea
 }
 
 func (h *Handler) refreshAnnouncement(s *discordgo.Session, m *store.Merge) {
-	h.editAnnouncement(s, m, announcementEmbed(m), announcementComponents(m, ""))
+	h.editAnnouncement(s, m, announcementEmbed(m), announcementComponents(m, ""), nil)
 }
 
-func (h *Handler) editAnnouncement(s *discordgo.Session, m *store.Merge, embed *discordgo.MessageEmbed, components []discordgo.MessageComponent) {
+// editAnnouncement troca os anexos do anúncio por files quando files não é nil.
+func (h *Handler) editAnnouncement(s *discordgo.Session, m *store.Merge, embed *discordgo.MessageEmbed, components []discordgo.MessageComponent, files []*discordgo.File) error {
 	if m.MessageID == "" {
-		return
+		return nil
 	}
 	edit := discordgo.NewMessageEdit(m.ChannelID, m.MessageID).SetEmbeds([]*discordgo.MessageEmbed{embed})
 	edit.Components = &components
 	edit.AllowedMentions = &discordgo.MessageAllowedMentions{}
+	if files != nil {
+		edit.Files = files
+		edit.Attachments = &[]*discordgo.MessageAttachment{}
+	}
 	if _, err := s.ChannelMessageEditComplex(edit); err != nil {
 		slog.Warn("editando anúncio", "err", err, "merge_id", m.ID)
+		return err
 	}
+	return nil
 }
 
 func modalValues(components []discordgo.MessageComponent) map[string]string {

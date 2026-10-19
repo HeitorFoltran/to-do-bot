@@ -3,6 +3,7 @@ package bot
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -266,5 +267,23 @@ func TestAnnouncementButtonOrder(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, []string{"Editar", "Cancelar", "Aprovar"}) {
 		t.Errorf("ordem = %v", got)
+	}
+}
+
+func TestHelpText(t *testing.T) {
+	got := helpText()
+	for _, want := range []string{
+		"`/merge responsavel [ddl]`",
+		"`/pendentes [responsavel] [criador]`",
+		"`/config lembrete [cron] [fuso] [ativo]`",
+		"*(admin)*",
+		"`/help`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("helpText sem %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "`/config`") {
+		t.Errorf("helpText listou /config sem subcomando:\n%s", got)
 	}
 }

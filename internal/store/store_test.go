@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"slices"
 	"testing"
@@ -180,6 +181,37 @@ func TestSetMessageID(t *testing.T) {
 	}
 }
 
+func TestMigratesOldSchema(t *testing.T) {
+	path := t.TempDir() + "/merges.db"
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	_, err = db.Exec(`CREATE TABLE merges (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, author_id TEXT NOT NULL,
+		reviewer_id TEXT NOT NULL, task_url TEXT NOT NULL, merge_url TEXT NOT NULL, note TEXT,
+		channel_id TEXT NOT NULL, message_id TEXT, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);
+		INSERT INTO merges (guild_id, author_id, reviewer_id, task_url, merge_url, channel_id)
+		VALUES ('g1', 'a', 'r1', 'https://t/1', '', 'c');`)
+	db.Close()
+	if err != nil {
+		t.Fatalf("criando schema antigo: %v", err)
+	}
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	got, err := st.Get(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.HasDDL || got.ReviewerID != "r1" {
+		t.Errorf("merge antigo: %+v", got)
+	}
+}
+
 func TestPersistsAcrossReopen(t *testing.T) {
 	path := t.TempDir() + "/merges.db"
 	st, err := Open(path)
@@ -264,6 +296,7 @@ func TestUpdate(t *testing.T) {
 	m.TaskURLs = []string{"https://t/novo"}
 	m.MergeURLs = []string{"https://m/1", "https://m/2"}
 	m.Note = ""
+	m.HasDDL = true
 	if err := st.Update(ctx, m); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
@@ -272,7 +305,7 @@ func TestUpdate(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 	if got.ReviewerID != "r2" || !slices.Equal(got.TaskURLs, m.TaskURLs) ||
-		!slices.Equal(got.MergeURLs, m.MergeURLs) || got.Note != "" || got.AuthorID != "author" {
+		!slices.Equal(got.MergeURLs, m.MergeURLs) || got.Note != "" || got.AuthorID != "author" || !got.HasDDL {
 		t.Errorf("depois do Update: %+v", got)
 	}
 

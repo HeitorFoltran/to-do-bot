@@ -16,7 +16,7 @@ const (
 	DefaultReminderCron = "0 9 * * 3"
 	DefaultTimezone     = "America/Sao_Paulo"
 	DefaultBackupCron   = "0 3 * * *"
-	DefaultBackupKeep   = 3
+	DefaultBackupKeep   = 2
 
 	ReminderOff = "off"
 )

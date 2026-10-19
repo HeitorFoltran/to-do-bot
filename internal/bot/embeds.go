@@ -65,6 +65,10 @@ func truncate(s string, max int) string {
 	return string(r[:max-1]) + "…"
 }
 
+func messageLink(m *store.Merge) string {
+	return fmt.Sprintf("https://discord.com/channels/%s/%s/%s", m.GuildID, m.ChannelID, m.MessageID)
+}
+
 func firstURL(urls []string) string {
 	if len(urls) == 0 {
 		return ""
@@ -76,11 +80,14 @@ func announcementEmbed(m *store.Merge) *discordgo.MessageEmbed {
 	fields := []*discordgo.MessageEmbedField{
 		{Name: "Autor", Value: mention(m.AuthorID), Inline: true},
 		{Name: "Responsável", Value: mention(m.ReviewerID), Inline: true},
-		{Name: "Tarefa(s)", Value: truncate(bulletList(m.TaskURLs), maxFieldLen)},
-		{Name: "Merge(s)", Value: truncate(bulletList(m.MergeURLs), maxFieldLen)},
+		{Name: "Tarefa(s):", Value: truncate(bulletList(m.TaskURLs), maxFieldLen)},
+		{Name: "Merge(s):", Value: truncate(bulletList(m.MergeURLs), maxFieldLen)},
 	}
 	if m.Note != "" {
-		fields = append(fields, &discordgo.MessageEmbedField{Name: "Obs", Value: m.Note})
+		fields = append(fields, &discordgo.MessageEmbedField{Name: "Obs:", Value: m.Note})
+	}
+	if m.HasDDL {
+		fields = append(fields, &discordgo.MessageEmbedField{Name: "DDL:", Value: "📎 Em anexo"})
 	}
 	return &discordgo.MessageEmbed{
 		Title:     fmt.Sprintf("Merge pendente #%d", m.ID),
@@ -150,6 +157,9 @@ func pendingText(m *store.Merge, loc *time.Location) string {
 	if m.Note != "" {
 		fmt.Fprintf(&b, "**Obs:** %s\n", m.Note)
 	}
+	if m.HasDDL && m.MessageID != "" {
+		fmt.Fprintf(&b, "\n**DDL:** 📎 [no anúncio](%s)\n", messageLink(m))
+	}
 	fmt.Fprintf(&b, "\n**Aberto em:** %s", m.CreatedAt.In(loc).Format("02/01/2006 15:04"))
 	return b.String()
 }
@@ -171,6 +181,7 @@ func pendingItem(m *store.Merge, text string, ownerActions bool) discordgo.Conta
 
 const (
 	actDone          = "merge_done"
+	actCreateModal   = "merge_create_modal"
 	actEdit          = "merge_edit"
 	actEditLinks     = "merge_edit_links"
 	actEditModal     = "merge_edit_modal"

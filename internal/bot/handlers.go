@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/bwmarrin/discordgo"
 
@@ -33,6 +32,7 @@ type Handler struct {
 	defaults store.Settings
 
 	registered sync.Map
+	drafts     drafts
 }
 
 func NewHandler(st *store.Store, rem *reminder.Reminder, sched *reminder.Scheduler, defaults store.Settings) *Handler {
@@ -67,6 +67,8 @@ func (h *Handler) OnInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 			h.handleComoEstamos(s, i)
 		case cmdConfig:
 			h.handleConfig(s, i)
+		case cmdHelp:
+			respondEphemeral(s, i, helpText())
 		default:
 			slog.Warn("comando desconhecido", "name", name)
 			respondEphemeral(s, i, "Comando desconhecido.")
@@ -98,9 +100,15 @@ func (h *Handler) OnInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 		}
 	case discordgo.InteractionModalSubmit:
 		customID := i.ModalSubmitData().CustomID
-		if action, id, ok := parseActionID(customID); ok && action == actEditModal {
-			h.handleEditModal(s, i, id)
-			return
+		if action, id, ok := parseActionID(customID); ok {
+			switch action {
+			case actCreateModal:
+				h.handleCreateModal(s, i, id)
+				return
+			case actEditModal:
+				h.handleEditModal(s, i, id)
+				return
+			}
 		}
 		slog.Warn("modal desconhecido", "custom_id", customID)
 		respondEphemeral(s, i, "Ação desconhecida.")
@@ -109,29 +117,7 @@ func (h *Handler) OnInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 
 func (h *Handler) handleMerge(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	data := i.ApplicationCommandData()
-	var rawTasks, rawMerges, reviewerID, note string
-	for _, opt := range data.Options {
-		switch opt.Name {
-		case optTarefa:
-			rawTasks = opt.StringValue()
-		case optMerge:
-			rawMerges = opt.StringValue()
-		case optResponsavel:
-			reviewerID = opt.UserValue(nil).ID
-		case optObs:
-			note = strings.TrimSpace(opt.StringValue())
-		}
-	}
-
-	taskURLs, mergeURLs, problem := parseLinks(rawTasks, rawMerges)
-	if problem != "" {
-		respondEphemeral(s, i, problem)
-		return
-	}
-	if utf8.RuneCountInString(note) > maxNoteLen {
-		respondEphemeral(s, i, fmt.Sprintf("A observação pode ter no máximo %d caracteres.", maxNoteLen))
-		return
-	}
+	reviewerID := userOption(i, optResponsavel)
 	if reviewerID == "" {
 		respondEphemeral(s, i, "Informe o responsável.")
 		return
@@ -140,50 +126,123 @@ func (h *Handler) handleMerge(s *discordgo.Session, i *discordgo.InteractionCrea
 		respondEphemeral(s, i, "O responsável não pode ser um bot.")
 		return
 	}
+	dr := draft{authorID: i.Member.User.ID, reviewerID: reviewerID}
+	if opt := optionByName(data.Options, optDDL); opt != nil && data.Resolved != nil {
+		dr.attachment = data.Resolved.Attachments[opt.StringValue()]
+		if dr.attachment != nil && dr.attachment.Size > maxDDLBytes {
+			respondEphemeral(s, i, fmt.Sprintf("O arquivo da DDL pode ter no máximo %d MB.", maxDDLBytes>>20))
+			return
+		}
+	}
+	ddlLabel := "DDL (opcional, se não anexou arquivo)"
+	if dr.attachment != nil {
+		ddlLabel = "DDL extra (o arquivo já vai anexado)"
+	}
+	modal := linksModal(actionID(actCreateModal, h.drafts.put(dr)), "Novo merge", ddlLabel, nil, nil, "")
+	if err := s.InteractionRespond(i.Interaction, modal); err != nil {
+		slog.Error("abrindo modal de criação", "err", err)
+	}
+}
+
+func (h *Handler) handleCreateModal(s *discordgo.Session, i *discordgo.InteractionCreate, draftID int64) {
+	dr, ok := h.drafts.take(draftID, i.Member.User.ID)
+	if !ok {
+		respondEphemeral(s, i, "Esse formulário expirou. Use /merge de novo.")
+		return
+	}
+	form, problem := parseLinksModal(i)
+	if problem != "" {
+		respondEphemeral(s, i, problem)
+		return
+	}
+
+	// Baixar o anexo pode passar dos 3 s que o Discord dá para responder.
+	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	}); err != nil {
+		slog.Error("adiando resposta do modal de criação", "err", err)
+		return
+	}
+	fail := func(content string) {
+		if err := s.InteractionResponseDelete(i.Interaction); err != nil {
+			slog.Warn("apagando resposta adiada", "err", err)
+		}
+		if _, err := s.FollowupMessageCreate(i.Interaction, false, &discordgo.WebhookParams{
+			Content:         content,
+			Flags:           discordgo.MessageFlagsEphemeral,
+			AllowedMentions: &discordgo.MessageAllowedMentions{},
+		}); err != nil {
+			slog.Error("avisando erro de criação", "err", err)
+		}
+	}
+
+	var files []*discordgo.File
+	if dr.attachment != nil {
+		dlCtx, dlCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		f, err := downloadAttachment(dlCtx, dr.attachment)
+		dlCancel()
+		if errors.Is(err, errTooBig) {
+			fail(fmt.Sprintf("O arquivo da DDL pode ter no máximo %d MB.", maxDDLBytes>>20))
+			return
+		}
+		if err != nil {
+			slog.Error("baixando anexo da DDL", "err", err, "arquivo", dr.attachment.Filename)
+			fail("Não consegui baixar o arquivo da DDL. Tente de novo.")
+			return
+		}
+		files = append(files, f)
+	}
 
 	m := &store.Merge{
 		GuildID:    i.GuildID,
 		AuthorID:   i.Member.User.ID,
-		ReviewerID: reviewerID,
-		TaskURLs:   taskURLs,
-		MergeURLs:  mergeURLs,
-		Note:       note,
+		ReviewerID: dr.reviewerID,
+		TaskURLs:   form.taskURLs,
+		MergeURLs:  form.mergeURLs,
+		Note:       form.note,
 		ChannelID:  i.ChannelID,
+		HasDDL:     dr.attachment != nil || form.ddl != "",
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 	if _, err := h.store.Create(ctx, m); err != nil {
 		slog.Error("criando merge", "err", err)
-		respondEphemeral(s, i, "Não consegui salvar o merge. Tente de novo.")
+		fail("Não consegui salvar o merge. Tente de novo.")
 		return
 	}
+	if form.ddl != "" {
+		files = append(files, ddlFile(m.ID, form.ddl))
+	}
 
-	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Embeds:     []*discordgo.MessageEmbed{announcementEmbed(m)},
-			Components: announcementComponents(m, ""),
-
-			AllowedMentions: &discordgo.MessageAllowedMentions{},
-		},
+	embeds := []*discordgo.MessageEmbed{announcementEmbed(m)}
+	components := announcementComponents(m, "")
+	msg, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds:          &embeds,
+		Components:      &components,
+		Files:           files,
+		AllowedMentions: &discordgo.MessageAllowedMentions{},
 	})
 	if err != nil {
-		slog.Error("respondendo /merge", "err", err, "merge_id", m.ID)
+		slog.Error("respondendo modal de criação", "err", err, "merge_id", m.ID)
 		if derr := h.store.Delete(ctx, m.ID); derr != nil {
 			slog.Error("desfazendo merge", "err", derr, "merge_id", m.ID)
 		}
-		return
-	}
-
-	msg, err := s.InteractionResponse(i.Interaction)
-	if err != nil {
-		slog.Warn("obtendo mensagem de anúncio", "err", err, "merge_id", m.ID)
+		fail("Não consegui publicar o merge. Tente de novo.")
 		return
 	}
 	if err := h.store.SetMessageID(ctx, m.ID, msg.ChannelID, msg.ID); err != nil {
 		slog.Warn("salvando message_id", "err", err, "merge_id", m.ID)
 	}
-	slog.Info("merge registrado", "merge_id", m.ID, "author", m.AuthorID, "reviewer", reviewerID)
+	slog.Info("merge registrado", "merge_id", m.ID, "author", m.AuthorID, "reviewer", m.ReviewerID, "ddl", m.HasDDL)
+}
+
+func optionByName(opts []*discordgo.ApplicationCommandInteractionDataOption, name string) *discordgo.ApplicationCommandInteractionDataOption {
+	for _, o := range opts {
+		if o.Name == name {
+			return o
+		}
+	}
+	return nil
 }
 
 func (h *Handler) handleComoEstamos(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -319,7 +378,7 @@ func (h *Handler) handleDoneButton(s *discordgo.Session, i *discordgo.Interactio
 	if err := updateClickedMessage(s, i, customID, doneLabel); err != nil {
 		slog.Error("atualizando mensagem da lista", "err", err, "merge_id", id)
 	}
-	h.editAnnouncement(s, m, doneEmbeds[0], doneComponents)
+	h.editAnnouncement(s, m, doneEmbeds[0], doneComponents, nil)
 }
 
 func (h *Handler) respondAlreadyDone(s *discordgo.Session, i *discordgo.InteractionCreate, customID string) {

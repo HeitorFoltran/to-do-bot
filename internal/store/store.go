@@ -46,6 +46,7 @@ type Merge struct {
 	Note       string
 	ChannelID  string
 	MessageID  string
+	HasDDL     bool
 	CreatedAt  time.Time
 }
 
@@ -69,7 +70,26 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrando schema: %w", err)
 	}
+	if err := addColumn(db, "merges", "has_ddl", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+func addColumn(db *sql.DB, table, column, def string) error {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n)
+	if err != nil {
+		return fmt.Errorf("verificando coluna %s.%s: %w", table, column, err)
+	}
+	if n > 0 {
+		return nil
+	}
+	if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, def)); err != nil {
+		return fmt.Errorf("adicionando coluna %s.%s: %w", table, column, err)
+	}
+	return nil
 }
 
 func (s *Store) Backup(ctx context.Context, path string) error {
@@ -89,10 +109,10 @@ func (s *Store) Create(ctx context.Context, m *Merge) (int64, error) {
 		createdAt = time.Now()
 	}
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO merges (guild_id, author_id, reviewer_id, task_url, merge_url, note, channel_id, message_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO merges (guild_id, author_id, reviewer_id, task_url, merge_url, note, channel_id, message_id, has_ddl, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.GuildID, m.AuthorID, m.ReviewerID, joinURLs(m.TaskURLs), joinURLs(m.MergeURLs),
-		nullString(m.Note), m.ChannelID, nullString(m.MessageID), formatTime(createdAt),
+		nullString(m.Note), m.ChannelID, nullString(m.MessageID), m.HasDDL, formatTime(createdAt),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("inserindo merge: %w", err)
@@ -206,8 +226,8 @@ func (s *Store) Delete(ctx context.Context, id int64) error {
 
 func (s *Store) Update(ctx context.Context, m *Merge) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE merges SET reviewer_id = ?, task_url = ?, merge_url = ?, note = ? WHERE id = ?`,
-		m.ReviewerID, joinURLs(m.TaskURLs), joinURLs(m.MergeURLs), nullString(m.Note), m.ID)
+		`UPDATE merges SET reviewer_id = ?, task_url = ?, merge_url = ?, note = ?, has_ddl = ? WHERE id = ?`,
+		m.ReviewerID, joinURLs(m.TaskURLs), joinURLs(m.MergeURLs), nullString(m.Note), m.HasDDL, m.ID)
 	if err != nil {
 		return fmt.Errorf("atualizando merge %d: %w", m.ID, err)
 	}
@@ -230,7 +250,7 @@ func (s *Store) SetMessageID(ctx context.Context, id int64, channelID, messageID
 }
 
 const selectCols = `SELECT id, guild_id, author_id, reviewer_id, task_url, merge_url,
-	COALESCE(note, ''), channel_id, COALESCE(message_id, ''), created_at FROM merges`
+	COALESCE(note, ''), channel_id, COALESCE(message_id, ''), has_ddl, created_at FROM merges`
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -240,7 +260,7 @@ func scanMerge(sc scanner) (*Merge, error) {
 	var m Merge
 	var taskURLs, mergeURLs, createdAt string
 	if err := sc.Scan(&m.ID, &m.GuildID, &m.AuthorID, &m.ReviewerID, &taskURLs, &mergeURLs,
-		&m.Note, &m.ChannelID, &m.MessageID, &createdAt); err != nil {
+		&m.Note, &m.ChannelID, &m.MessageID, &m.HasDDL, &createdAt); err != nil {
 		return nil, err
 	}
 	m.TaskURLs = splitURLs(taskURLs)
